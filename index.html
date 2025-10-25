@@ -1,147 +1,254 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI Venture Builder — 10-Step Automation</title>
-  <style>
-    body {
-      margin: 0;
-      font-family: "Poppins", sans-serif;
-      background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
-      color: #fff;
-      overflow-x: hidden;
+"""
+signal_bot_with_rsi_atr.py
+Educational signal bot + backtester with:
+ - SMA crossover entry
+ - RSI filter (momentum confirmation)
+ - ATR-based volatility stop (Chandelier/ATR stop)
+ - Fixed-fraction position sizing (risk percent per trade)
+ - TP (take-profit) and SL (stop-loss) mechanics
+
+This is NOT financial advice. No guarantees. Use paper trading, out-of-sample tests.
+"""
+
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from datetime import time
+import math
+
+# -----------------------------
+# PARAMETERS (tune these)
+# -----------------------------
+SYMBOL = "BTC-USD"        # yfinance symbol
+START = "2023-01-01"
+END = None
+INTERVAL = "1d"           # "1d", "1h", "1m" (yfinance supports limited intraday)
+FAST_SMA = 10
+SLOW_SMA = 30
+
+# RSI settings
+RSI_PERIOD = 14           # typical default
+RSI_MIN = 50              # require RSI > RSI_MIN to confirm long momentum (tunable)
+RSI_MAX = 90              # optional: avoid extreme RSI if desired
+
+# ATR / volatility stop settings
+ATR_PERIOD = 14
+ATR_MULTIPLIER = 3.0      # common choices: 2.0 - 3.0
+
+# TP/SL (secondary exits); TP is percent, SL_pct is percent fallback
+TP_PCT = 0.05             # 5% take-profit (optional)
+SL_PCT_FALLBACK = 0.02    # 2% fixed stop as fallback if volatility stop isn't desired
+
+# Position sizing / risk
+RISK_PER_TRADE = 0.01     # risk 1% of equity per trade (fixed-fraction sizing)
+
+# Time-to-open (HH:MM) - set to None to ignore; for intraday testing
+TIME_TO_OPEN = None       # e.g. "09:30"  (ignored for daily bars)
+# -----------------------------
+
+def fetch_data(symbol, start, end, interval="1d"):
+    df = yf.download(symbol, start=start, end=end, interval=interval, progress=False)
+    if df.empty:
+        raise RuntimeError(f"No data for {symbol}")
+    df = df[['Open','High','Low','Close','Adj Close','Volume']].copy()
+    df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+    return df
+
+def compute_indicators(df):
+    # SMAs
+    df['sma_fast'] = df['close'].rolling(FAST_SMA, min_periods=1).mean()
+    df['sma_slow'] = df['close'].rolling(SLOW_SMA, min_periods=1).mean()
+
+    # SMA crossover entry flags
+    df['sma_signal'] = np.where(df['sma_fast'] > df['sma_slow'], 1, 0)
+    df['sma_entry'] = df['sma_signal'].diff().fillna(0) > 0
+
+    # RSI (Wilder's RSI)
+    delta = df['close'].diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+    rs = ma_up / ma_down
+    df['rsi'] = 100 - (100 / (1 + rs))
+
+    # ATR
+    df['tr1'] = df['high'] - df['low']
+    df['tr2'] = (df['high'] - df['close'].shift(1)).abs()
+    df['tr3'] = (df['low'] - df['close'].shift(1)).abs()
+    df['tr'] = df[['tr1','tr2','tr3']].max(axis=1)
+    df['atr'] = df['tr'].rolling(ATR_PERIOD, min_periods=1).mean()
+
+    # Highest high over ATR period (for chandelier exit)
+    df['hh_period'] = df['high'].rolling(ATR_PERIOD, min_periods=1).max()
+
+    return df
+
+def parse_time_to_open(tstr):
+    if not tstr:
+        return None
+    hh, mm = [int(x) for x in tstr.split(":")]
+    return time(hh, mm)
+
+def backtest(df,
+             tp_pct=TP_PCT,
+             sl_pct_fallback=SL_PCT_FALLBACK,
+             atr_mult=ATR_MULTIPLIER,
+             risk_per_trade=RISK_PER_TRADE,
+             time_to_open_str=TIME_TO_OPEN,
+             verbose=False):
+    tto = parse_time_to_open(time_to_open_str)
+    equity = 10000.0
+    position = None
+    trades = []
+
+    for idx, row in df.iterrows():
+        # Evaluate current open position first
+        if position is not None:
+            # Compute current volatility stop (Chandelier long): highest high over N - ATR * mult
+            # Using precomputed hh_period & atr at current index
+            vol_stop = row['hh_period'] - (row['atr'] * atr_mult)
+            # For simpler single-bar decisions: check if current bar low <= vol_stop -> exit
+            hit_vol_stop = row['low'] <= vol_stop if not math.isnan(vol_stop) else False
+
+            # Also check TP/SL based on entry values
+            hit_tp = row['high'] >= position['tp']
+            hit_sl = row['low'] <= position['sl']
+
+            # Resolve conflicts: if multiple hits same bar, conservative ordering: baseline SL first
+            exit_reason = None
+            exit_price = None
+            if hit_sl:
+                exit_reason = 'sl'
+                exit_price = max(position['sl'], row['open'])  # conservative: prefer stop price
+            elif hit_vol_stop:
+                exit_reason = 'vol_stop'
+                exit_price = vol_stop
+            elif hit_tp:
+                exit_reason = 'tp'
+                exit_price = position['tp']
+
+            if exit_reason:
+                # compute size-based realized pnl
+                size = position['size']  # number of units
+                realized = (exit_price - position['entry_price']) * size
+                equity += realized
+                trades.append({
+                    'entry_index': position['entry_index'],
+                    'exit_index': idx,
+                    'entry_price': position['entry_price'],
+                    'exit_price': exit_price,
+                    'exit_reason': exit_reason,
+                    'size': size,
+                    'pnl': realized,
+                    'equity_after': equity
+                })
+                if verbose:
+                    print(f"[{idx}] Closed {exit_reason} entry {position['entry_price']:.4f} exit {exit_price:.4f} pnl {realized:.2f}")
+                position = None
+                # no new entry same bar for simplicity
+                continue
+
+        # No open position: check entry conditions
+        if position is None and row.get('sma_entry', False):
+            # RSI filter: require RSI above threshold to confirm momentum (tunable)
+            rsi_ok = (not math.isnan(row.get('rsi', float('nan')))) and (row['rsi'] >= RSI_MIN)
+            if not rsi_ok:
+                if verbose:
+                    print(f"[{idx}] Skipping entry due to RSI {row.get('rsi')}")
+                continue
+
+            # Time-to-open check (for intraday bars only)
+            if tto is not None and isinstance(idx, pd.Timestamp) and (idx.time() < tto):
+                if verbose:
+                    print(f"[{idx}] Skipping entry due to time-to-open {tto}")
+                continue
+
+            # Determine entry price (we'll assume we get the next bar open = current open here)
+            entry_price = row['open']
+
+            # Compute ATR-based volatility stop (Chandelier long)
+            # Use hh_period and atr at this same index
+            vol_stop = row['hh_period'] - (row['atr'] * atr_mult)
+            # Fallback stop: percentage-based if vol_stop is NaN or would be >= entry
+            if math.isnan(vol_stop) or vol_stop >= entry_price:
+                stop_price = entry_price * (1 - sl_pct_fallback)
+            else:
+                stop_price = vol_stop
+
+            # Compute take-profit price (percentage)
+            tp_price = entry_price * (1 + tp_pct)
+
+            # Position sizing: risk fixed fraction of equity
+            risk_amount = equity * risk_per_trade
+            risk_per_unit = entry_price - stop_price
+            if risk_per_unit <= 0:
+                if verbose:
+                    print(f"[{idx}] Invalid risk per unit (<=0). Skipping entry.")
+                continue
+            size = risk_amount / risk_per_unit
+            # Protect against absurdly large sizes on tiny denominators
+            size = max(0, size)
+
+            # Save position
+            position = {
+                'entry_price': entry_price,
+                'entry_index': idx,
+                'tp': tp_price,
+                'sl': stop_price,
+                'size': size
+            }
+            if verbose:
+                print(f"[{idx}] Opened long entry {entry_price:.4f} size {size:.4f} tp {tp_price:.4f} sl {stop_price:.4f}")
+
+    # End of data: close remaining position at last close (mark-to-market)
+    if position is not None:
+        last_price = df.iloc[-1]['close']
+        realized = (last_price - position['entry_price']) * position['size']
+        equity += realized
+        trades.append({
+            'entry_index': position['entry_index'],
+            'exit_index': df.index[-1],
+            'entry_price': position['entry_price'],
+            'exit_price': last_price,
+            'exit_reason': 'mkt_close',
+            'size': position['size'],
+            'pnl': realized,
+            'equity_after': equity
+        })
+        position = None
+
+    trades_df = pd.DataFrame(trades)
+    results = {
+        'start_equity': 10000.0,
+        'end_equity': equity,
+        'n_trades': len(trades_df),
+        'trades': trades_df
     }
+    if len(trades_df) > 0:
+        results['win_rate'] = (trades_df['pnl'] > 0).mean()
+        results['total_pnl'] = trades_df['pnl'].sum()
+    else:
+        results['win_rate'] = None
+        results['total_pnl'] = 0.0
 
-    header {
-      text-align: center;
-      padding: 100px 20px 60px;
-      background: linear-gradient(45deg, #1e3c72, #2a5298);
-      animation: bgShift 8s infinite alternate;
-    }
+    return results
 
-    @keyframes bgShift {
-      0% { background-position: left; }
-      100% { background-position: right; }
-    }
+def run_demo():
+    print("Fetching data for:", SYMBOL)
+    df = fetch_data(SYMBOL, START, END, INTERVAL)
+    df = compute_indicators(df)
+    print("Data:", df.index[0], "->", df.index[-1])
+    res = backtest(df, tp_pct=TP_PCT, sl_pct_fallback=SL_PCT_FALLBACK,
+                   atr_mult=ATR_MULTIPLIER, risk_per_trade=RISK_PER_TRADE,
+                   time_to_open_str=TIME_TO_OPEN, verbose=False)
+    print("Start equity:", res['start_equity'])
+    print("End equity:  ", res['end_equity'])
+    print("Trades:      ", res['n_trades'])
+    print("Win rate:    ", res['win_rate'])
+    print("Total PnL:   ", res['total_pnl'])
+    if res['n_trades'] > 0:
+        print(res['trades'].head().to_string(index=False))
 
-    header h1 {
-      font-size: 2.8rem;
-      margin-bottom: 10px;
-    }
-
-    header p {
-      font-size: 1.2rem;
-      color: #ddd;
-    }
-
-    .steps {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 40px;
-      padding: 60px 20px;
-    }
-
-    .step {
-      width: 90%;
-      max-width: 700px;
-      background: rgba(255, 255, 255, 0.08);
-      border: 1px solid rgba(255,255,255,0.2);
-      border-radius: 15px;
-      padding: 30px;
-      box-shadow: 0 0 20px rgba(0,0,0,0.3);
-      opacity: 0;
-      transform: translateY(50px);
-      transition: all 0.8s ease;
-    }
-
-    .step.visible {
-      opacity: 1;
-      transform: translateY(0);
-    }
-
-    .step-number {
-      font-size: 2rem;
-      font-weight: 700;
-      background: linear-gradient(90deg, #ff7eb3, #ff758c);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-
-    .step h2 {
-      margin: 10px 0;
-      font-size: 1.5rem;
-    }
-
-    .step p {
-      color: #ccc;
-      font-size: 1rem;
-    }
-
-    footer {
-      text-align: center;
-      padding: 60px 20px;
-      background: #111;
-    }
-
-    .cta {
-      margin-top: 30px;
-      display: inline-block;
-      background: linear-gradient(45deg, #ff7eb3, #ff758c);
-      padding: 15px 40px;
-      border-radius: 30px;
-      color: #fff;
-      text-decoration: none;
-      font-weight: 600;
-      transition: 0.3s ease;
-    }
-
-    .cta:hover {
-      transform: scale(1.05);
-      box-shadow: 0 0 20px rgba(255,118,150,0.7);
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>💡 AI Venture Builder</h1>
-    <p>From Idea → Design → Traffic → Profit — Automated.</p>
-  </header>
-
-  <section class="steps">
-    <div class="step"><div class="step-number">0️⃣ Idea Gen</div><h2>Brainstorm Biz Ideas Fast</h2><p>Use ChatGPT, Claude, or Perplexity to generate, refine, and validate business ideas instantly.</p></div>
-    <div class="step"><div class="step-number">1️⃣ Name + Domain</div><h2>Brand Creation</h2><p>Generate unique names with Namelix and secure your domain via GoDaddy.</p></div>
-    <div class="step"><div class="step-number">2️⃣ Logo + Brand</div><h2>Design Your Identity</h2><p>Create sleek logos with Looka, Brandmark, or Canva Magic Design.</p></div>
-    <div class="step"><div class="step-number">3️⃣ Website Build</div><h2>AI-Powered Website in Minutes</h2><p>Use Durable.ai, Framer AI, or 10Web.io to build your website effortlessly.</p></div>
-    <div class="step"><div class="step-number">4️⃣ Products Setup</div><h2>Smart Product Management</h2><p>Leverage Shopify Magic, Notion AI, and Excel Formula Bot to automate product workflows.</p></div>
-    <div class="step"><div class="step-number">5️⃣ Payments + Automation</div><h2>Get Paid Automatically</h2><p>Integrate Stripe + Zapier or Make.com for seamless payment and workflow automation.</p></div>
-    <div class="step"><div class="step-number">6️⃣ Launch Automation</div><h2>Deploy Instantly</h2><p>Use Cloudflare Pages or Vercel AI Deploy to take your project live with one click.</p></div>
-    <div class="step"><div class="step-number">7️⃣ Social Posting</div><h2>Social Media on Autopilot</h2><p>Schedule, post, and analyze using Ocoya, Predis.ai, or SocialBee AI.</p></div>
-    <div class="step"><div class="step-number">8️⃣ Ads Creation</div><h2>Convert Attention into Sales</h2><p>Generate ad creatives and copy fast with AdCreative.ai, Copy.ai, or Simplified.</p></div>
-    <div class="step"><div class="step-number">9️⃣ SEO + Traffic</div><h2>Drive Organic Growth</h2><p>Optimize your website using SurferSEO, NeuronWriter, or Writesonic.</p></div>
-    <div class="step"><div class="step-number">🔟 Profit & Scale</div><h2>Automate Growth Analytics</h2><p>Track and scale profits using Notion AI Dashboards, QuickBooks AI, and ChatGPT strategy.</p></div>
-  </section>
-
-  <footer>
-    <h2>💥 Build Your Self-Running Online Venture</h2>
-    <a href="#" class="cta">Launch Now</a>
-  </footer>
-
-  <script>
-    const steps = document.querySelectorAll('.step');
-    const revealOnScroll = () => {
-      const trigger = window.innerHeight * 0.8;
-      steps.forEach(step => {
-        const top = step.getBoundingClientRect().top;
-        if (top < trigger) {
-          step.classList.add('visible');
-        }
-      });
-    };
-
-    window.addEventListener('scroll', revealOnScroll);
-    revealOnScroll();
-  </script>
-</body>
-</html>
+if __name__ == "__main__":
+    run_demo()
