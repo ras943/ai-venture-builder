@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Venture Builder — 10-Step Automation</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Poppins", sans-serif;
+      background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
+      color: #fff;
+      overflow-x: hidden;
+    }
+
+    header {
+      text-align: center;
+      padding: 100px 20px 60px;
+      background: linear-gradient(45deg, #1e3c72, #2a5298);
+      animation: bgShift 8s infinite alternate;
+    }
+
+    @keyframes bgShift {
+      0% { background-position: left; }
+      100% { background-position: right; }
+    }
+
+    header h1 {
+      font-size: 2.8rem;
+      margin-bottom: 10px;
+    }
+
+    header p {
+      font-size: 1.2rem;
+      color: #ddd;
+    }
+
+    .steps {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 40px;
+      padding: 60px 20px;
+    }
+
+    .step {
+      width: 90%;
+      max-width: 700px;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 15px;
+      padding: 30px;
+      box-shadow: 0 0 20px rgba(0,0,0,0.3);
+      opacity: 0;
+      transform: translateY(50px);
+      transition: all 0.8s ease;
+    }
+
+    .step.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .step-number {
+      font-size: 2rem;
+      font-weight: 700;
+      background: linear-gradient(90deg, #ff7eb3, #ff758c);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .step h2 {
+      margin: 10px 0;
+      font-size: 1.5rem;
+    }
+
+    .step p {
+      color: #ccc;
+      font-size: 1rem;
+    }
+
+    footer {
+      text-align: center;
+      padding: 60px 20px;
+      background: #111;
+    }
+
+    .cta {
+      margin-top: 30px;
+      display: inline-block;
+      background: linear-gradient(45deg, #ff7eb3, #ff758c);
+      padding: 15px 40px;
+      border-radius: 30px;
+      color: #fff;
+      text-decoration: none;
+      font-weight: 600;
+      transition: 0.3s ease;
+    }
+
+    .cta:hover {
+      transform: scale(1.05);
+      box-shadow: 0 0 20px rgba(255,118,150,0.7);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>💡 AI Venture Builder</h1>
+    <p>From Idea → Design → Traffic → Profit — Automated.</p>
+  </header>
+
+  <section class="steps">
+    <div class="step"><div class="step-number">0️⃣ Idea Gen</div><h2>Brainstorm Biz Ideas Fast</h2><p>Use ChatGPT, Claude, or Perplexity to generate, refine, and validate business ideas instantly.</p></div>
+    <div class="step"><div class="step-number">1️⃣ Name + Domain</div><h2>Brand Creation</h2><p>Generate unique names with Namelix and secure your domain via GoDaddy.</p></div>
+    <div class="step"><div class="step-number">2️⃣ Logo + Brand</div><h2>Design Your Identity</h2><p>Create sleek logos with Looka, Brandmark, or Canva Magic Design.</p></div>
+    <div class="step"><div class="step-number">3️⃣ Website Build</div><h2>AI-Powered Website in Minutes</h2><p>Use Durable.ai, Framer AI, or 10Web.io to build your website effortlessly.</p></div>
+    <div class="step"><div class="step-number">4️⃣ Products Setup</div><h2>Smart Product Management</h2><p>Leverage Shopify Magic, Notion AI, and Excel Formula Bot to automate product workflows.</p></div>
+    <div class="step"><div class="step-number">5️⃣ Payments + Automation</div><h2>Get Paid Automatically</h2><p>Integrate Stripe + Zapier or Make.com for seamless payment and workflow automation.</p></div>
+    <div class="step"><div class="step-number">6️⃣ Launch Automation</div><h2>Deploy Instantly</h2><p>Use Cloudflare Pages or Vercel AI Deploy to take your project live with one click.</p></div>
+    <div class="step"><div class="step-number">7️⃣ Social Posting</div><h2>Social Media on Autopilot</h2><p>Schedule, post, and analyze using Ocoya, Predis.ai, or SocialBee AI.</p></div>
+    <div class="step"><div class="step-number">8️⃣ Ads Creation</div><h2>Convert Attention into Sales</h2><p>Generate ad creatives and copy fast with AdCreative.ai, Copy.ai, or Simplified.</p></div>
+    <div class="step"><div class="step-number">9️⃣ SEO + Traffic</div><h2>Drive Organic Growth</h2><p>Optimize your website using SurferSEO, NeuronWriter, or Writesonic.</p></div>
+    <div class="step"><div class="step-number">🔟 Profit & Scale</div><h2>Automate Growth Analytics</h2><p>Track and scale profits using Notion AI Dashboards, QuickBooks AI, and ChatGPT strategy.</p></div>
+  </section>
+
+  <footer>
+    <h2>💥 Build Your Self-Running Online Venture</h2>
+    <a href="#" class="cta">Launch Now</a>
+  </footer>
+
+  <script>
+    const steps = document.querySelectorAll('.step');
+    const revealOnScroll = () => {
+      const trigger = window.innerHeight * 0.8;
+      steps.forEach(step => {
+        const top = step.getBoundingClientRect().top;
+        if (top < trigger) {
+          step.classList.add('visible');
+        }
+      });
+    };
+
+    window.addEventListener('scroll', revealOnScroll);
+    revealOnScroll();
+  </script>
+</body>
+</html>
