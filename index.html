@@ -1,254 +1,430 @@
-"""
-signal_bot_with_rsi_atr.py
-Educational signal bot + backtester with:
- - SMA crossover entry
- - RSI filter (momentum confirmation)
- - ATR-based volatility stop (Chandelier/ATR stop)
- - Fixed-fraction position sizing (risk percent per trade)
- - TP (take-profit) and SL (stop-loss) mechanics
+// State Management
+let state = {
+  products: [],
+  orders: [],
+  currentProduct: null,
+  cart: [],
+  adminMode: false
+};
 
-This is NOT financial advice. No guarantees. Use paper trading, out-of-sample tests.
-"""
+// DOM Elements
+const elements = {
+  notification: document.getElementById('notification'),
+  productsGrid: document.getElementById('products-grid'),
+  adminPanel: document.getElementById('admin-panel'),
+  customizerModal: document.getElementById('customizer-modal'),
+  importModal: document.getElementById('import-modal'),
+  adminProductsList: document.getElementById('admin-products-list'),
+  // ... add other element references as needed
+};
 
-import pandas as pd
-import numpy as np
-import yfinance as yf
-from datetime import time
-import math
+// Initialize the application
+function init() {
+  loadSampleData();
+  renderProducts();
+  setupEventListeners();
+  updateStats();
+}
 
-# -----------------------------
-# PARAMETERS (tune these)
-# -----------------------------
-SYMBOL = "BTC-USD"        # yfinance symbol
-START = "2023-01-01"
-END = None
-INTERVAL = "1d"           # "1d", "1h", "1m" (yfinance supports limited intraday)
-FAST_SMA = 10
-SLOW_SMA = 30
-
-# RSI settings
-RSI_PERIOD = 14           # typical default
-RSI_MIN = 50              # require RSI > RSI_MIN to confirm long momentum (tunable)
-RSI_MAX = 90              # optional: avoid extreme RSI if desired
-
-# ATR / volatility stop settings
-ATR_PERIOD = 14
-ATR_MULTIPLIER = 3.0      # common choices: 2.0 - 3.0
-
-# TP/SL (secondary exits); TP is percent, SL_pct is percent fallback
-TP_PCT = 0.05             # 5% take-profit (optional)
-SL_PCT_FALLBACK = 0.02    # 2% fixed stop as fallback if volatility stop isn't desired
-
-# Position sizing / risk
-RISK_PER_TRADE = 0.01     # risk 1% of equity per trade (fixed-fraction sizing)
-
-# Time-to-open (HH:MM) - set to None to ignore; for intraday testing
-TIME_TO_OPEN = None       # e.g. "09:30"  (ignored for daily bars)
-# -----------------------------
-
-def fetch_data(symbol, start, end, interval="1d"):
-    df = yf.download(symbol, start=start, end=end, interval=interval, progress=False)
-    if df.empty:
-        raise RuntimeError(f"No data for {symbol}")
-    df = df[['Open','High','Low','Close','Adj Close','Volume']].copy()
-    df.columns = [c.lower().replace(' ', '_') for c in df.columns]
-    return df
-
-def compute_indicators(df):
-    # SMAs
-    df['sma_fast'] = df['close'].rolling(FAST_SMA, min_periods=1).mean()
-    df['sma_slow'] = df['close'].rolling(SLOW_SMA, min_periods=1).mean()
-
-    # SMA crossover entry flags
-    df['sma_signal'] = np.where(df['sma_fast'] > df['sma_slow'], 1, 0)
-    df['sma_entry'] = df['sma_signal'].diff().fillna(0) > 0
-
-    # RSI (Wilder's RSI)
-    delta = df['close'].diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
-    rs = ma_up / ma_down
-    df['rsi'] = 100 - (100 / (1 + rs))
-
-    # ATR
-    df['tr1'] = df['high'] - df['low']
-    df['tr2'] = (df['high'] - df['close'].shift(1)).abs()
-    df['tr3'] = (df['low'] - df['close'].shift(1)).abs()
-    df['tr'] = df[['tr1','tr2','tr3']].max(axis=1)
-    df['atr'] = df['tr'].rolling(ATR_PERIOD, min_periods=1).mean()
-
-    # Highest high over ATR period (for chandelier exit)
-    df['hh_period'] = df['high'].rolling(ATR_PERIOD, min_periods=1).max()
-
-    return df
-
-def parse_time_to_open(tstr):
-    if not tstr:
-        return None
-    hh, mm = [int(x) for x in tstr.split(":")]
-    return time(hh, mm)
-
-def backtest(df,
-             tp_pct=TP_PCT,
-             sl_pct_fallback=SL_PCT_FALLBACK,
-             atr_mult=ATR_MULTIPLIER,
-             risk_per_trade=RISK_PER_TRADE,
-             time_to_open_str=TIME_TO_OPEN,
-             verbose=False):
-    tto = parse_time_to_open(time_to_open_str)
-    equity = 10000.0
-    position = None
-    trades = []
-
-    for idx, row in df.iterrows():
-        # Evaluate current open position first
-        if position is not None:
-            # Compute current volatility stop (Chandelier long): highest high over N - ATR * mult
-            # Using precomputed hh_period & atr at current index
-            vol_stop = row['hh_period'] - (row['atr'] * atr_mult)
-            # For simpler single-bar decisions: check if current bar low <= vol_stop -> exit
-            hit_vol_stop = row['low'] <= vol_stop if not math.isnan(vol_stop) else False
-
-            # Also check TP/SL based on entry values
-            hit_tp = row['high'] >= position['tp']
-            hit_sl = row['low'] <= position['sl']
-
-            # Resolve conflicts: if multiple hits same bar, conservative ordering: baseline SL first
-            exit_reason = None
-            exit_price = None
-            if hit_sl:
-                exit_reason = 'sl'
-                exit_price = max(position['sl'], row['open'])  # conservative: prefer stop price
-            elif hit_vol_stop:
-                exit_reason = 'vol_stop'
-                exit_price = vol_stop
-            elif hit_tp:
-                exit_reason = 'tp'
-                exit_price = position['tp']
-
-            if exit_reason:
-                # compute size-based realized pnl
-                size = position['size']  # number of units
-                realized = (exit_price - position['entry_price']) * size
-                equity += realized
-                trades.append({
-                    'entry_index': position['entry_index'],
-                    'exit_index': idx,
-                    'entry_price': position['entry_price'],
-                    'exit_price': exit_price,
-                    'exit_reason': exit_reason,
-                    'size': size,
-                    'pnl': realized,
-                    'equity_after': equity
-                })
-                if verbose:
-                    print(f"[{idx}] Closed {exit_reason} entry {position['entry_price']:.4f} exit {exit_price:.4f} pnl {realized:.2f}")
-                position = None
-                # no new entry same bar for simplicity
-                continue
-
-        # No open position: check entry conditions
-        if position is None and row.get('sma_entry', False):
-            # RSI filter: require RSI above threshold to confirm momentum (tunable)
-            rsi_ok = (not math.isnan(row.get('rsi', float('nan')))) and (row['rsi'] >= RSI_MIN)
-            if not rsi_ok:
-                if verbose:
-                    print(f"[{idx}] Skipping entry due to RSI {row.get('rsi')}")
-                continue
-
-            # Time-to-open check (for intraday bars only)
-            if tto is not None and isinstance(idx, pd.Timestamp) and (idx.time() < tto):
-                if verbose:
-                    print(f"[{idx}] Skipping entry due to time-to-open {tto}")
-                continue
-
-            # Determine entry price (we'll assume we get the next bar open = current open here)
-            entry_price = row['open']
-
-            # Compute ATR-based volatility stop (Chandelier long)
-            # Use hh_period and atr at this same index
-            vol_stop = row['hh_period'] - (row['atr'] * atr_mult)
-            # Fallback stop: percentage-based if vol_stop is NaN or would be >= entry
-            if math.isnan(vol_stop) or vol_stop >= entry_price:
-                stop_price = entry_price * (1 - sl_pct_fallback)
-            else:
-                stop_price = vol_stop
-
-            # Compute take-profit price (percentage)
-            tp_price = entry_price * (1 + tp_pct)
-
-            # Position sizing: risk fixed fraction of equity
-            risk_amount = equity * risk_per_trade
-            risk_per_unit = entry_price - stop_price
-            if risk_per_unit <= 0:
-                if verbose:
-                    print(f"[{idx}] Invalid risk per unit (<=0). Skipping entry.")
-                continue
-            size = risk_amount / risk_per_unit
-            # Protect against absurdly large sizes on tiny denominators
-            size = max(0, size)
-
-            # Save position
-            position = {
-                'entry_price': entry_price,
-                'entry_index': idx,
-                'tp': tp_price,
-                'sl': stop_price,
-                'size': size
-            }
-            if verbose:
-                print(f"[{idx}] Opened long entry {entry_price:.4f} size {size:.4f} tp {tp_price:.4f} sl {stop_price:.4f}")
-
-    # End of data: close remaining position at last close (mark-to-market)
-    if position is not None:
-        last_price = df.iloc[-1]['close']
-        realized = (last_price - position['entry_price']) * position['size']
-        equity += realized
-        trades.append({
-            'entry_index': position['entry_index'],
-            'exit_index': df.index[-1],
-            'entry_price': position['entry_price'],
-            'exit_price': last_price,
-            'exit_reason': 'mkt_close',
-            'size': position['size'],
-            'pnl': realized,
-            'equity_after': equity
-        })
-        position = None
-
-    trades_df = pd.DataFrame(trades)
-    results = {
-        'start_equity': 10000.0,
-        'end_equity': equity,
-        'n_trades': len(trades_df),
-        'trades': trades_df
+// Load sample data
+function loadSampleData() {
+  const sampleProducts = [
+    {
+      id: 'p1',
+      title: 'Articulated Dinosaur',
+      price: 1200,
+      description: 'Fully articulated 3D printed dinosaur with movable joints',
+      category: 'custom-items',
+      image: '',
+      state: 'active'
+    },
+    {
+      id: 'p2',
+      title: 'Phone Stand',
+      price: 450,
+      description: 'Elegant phone stand with cable management',
+      category: 'phone-stands',
+      image: '',
+      state: 'active'
+    },
+    {
+      id: 'p3',
+      title: 'Custom Keychain',
+      price: 300,
+      description: 'Personalized keychain with text engraving',
+      category: 'accessories',
+      image: '',
+      state: 'active'
+    },
+    {
+      id: 'p4',
+      title: 'Planter Pot',
+      price: 650,
+      description: 'Geometric plant pot with drainage',
+      category: 'home-decor',
+      image: '',
+      state: 'active'
     }
-    if len(trades_df) > 0:
-        results['win_rate'] = (trades_df['pnl'] > 0).mean()
-        results['total_pnl'] = trades_df['pnl'].sum()
-    else:
-        results['win_rate'] = None
-        results['total_pnl'] = 0.0
+  ];
 
-    return results
+  // Load from localStorage or use sample data
+  const savedProducts = localStorage.getItem('xustom3d-products');
+  state.products = savedProducts ? JSON.parse(savedProducts) : sampleProducts;
+  
+  // Save initial data if not present
+  if (!savedProducts) {
+    localStorage.setItem('xustom3d-products', JSON.stringify(sampleProducts));
+  }
+}
 
-def run_demo():
-    print("Fetching data for:", SYMBOL)
-    df = fetch_data(SYMBOL, START, END, INTERVAL)
-    df = compute_indicators(df)
-    print("Data:", df.index[0], "->", df.index[-1])
-    res = backtest(df, tp_pct=TP_PCT, sl_pct_fallback=SL_PCT_FALLBACK,
-                   atr_mult=ATR_MULTIPLIER, risk_per_trade=RISK_PER_TRADE,
-                   time_to_open_str=TIME_TO_OPEN, verbose=False)
-    print("Start equity:", res['start_equity'])
-    print("End equity:  ", res['end_equity'])
-    print("Trades:      ", res['n_trades'])
-    print("Win rate:    ", res['win_rate'])
-    print("Total PnL:   ", res['total_pnl'])
-    if res['n_trades'] > 0:
-        print(res['trades'].head().to_string(index=False))
+// Render products to the shop grid
+function renderProducts() {
+  const activeProducts = state.products.filter(p => p.state === 'active');
+  
+  elements.productsGrid.innerHTML = activeProducts.map(product => `
+    <div class="card">
+      <div class="product-img">
+        ${product.image ? 
+          `<img src="${product.image}" alt="${product.title}">` : 
+          `<i class="fas fa-cube fa-3x" style="color:#7c3aed"></i>`
+        }
+      </div>
+      <h3>${product.title}</h3>
+      <p class="small">${product.description}</p>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px">
+        <div style="font-weight:700;color:var(--primary)">₨ ${product.price}</div>
+        <button class="cta" onclick="openCustomizer('${product.id}')">
+          <i class="fas fa-palette"></i>
+          Customize
+        </button>
+      </div>
+    </div>
+  `).join('');
+}
 
-if __name__ == "__main__":
-    run_demo()
+// Setup all event listeners
+function setupEventListeners() {
+  // Admin panel toggle
+  document.getElementById('open-admin-panel').addEventListener('click', () => {
+    elements.adminPanel.classList.add('visible');
+  });
+  
+  document.getElementById('close-admin').addEventListener('click', () => {
+    elements.adminPanel.classList.remove('visible');
+  });
+  
+  // Customizer modal
+  document.getElementById('open-customize').addEventListener('click', () => {
+    openCustomizer('p1');
+  });
+  
+  document.getElementById('close-customizer').addEventListener('click', () => {
+    elements.customizerModal.classList.remove('visible');
+  });
+  
+  // Product management
+  document.getElementById('add-product-btn').addEventListener('click', addOrUpdateProduct);
+  
+  // Import/Export
+  document.getElementById('export-products').addEventListener('click', exportProducts);
+  document.getElementById('import-products').addEventListener('click', () => {
+    elements.importModal.classList.add('visible');
+  });
+  
+  document.getElementById('run-import').addEventListener('click', importProducts);
+  document.getElementById('cancel-import').addEventListener('click', () => {
+    elements.importModal.classList.remove('visible');
+  });
+  
+  // Contact form
+  document.getElementById('send-contact').addEventListener('click', sendContactMessage);
+  
+  // Navigation
+  document.querySelectorAll('[data-route]').forEach(link => {
+    link.addEventListener('click', (e) => {
+      e.preventDefault();
+      const route = e.target.getAttribute('href').substring(1);
+      navigateTo(route);
+    });
+  });
+}
+
+// Navigation function
+function navigateTo(route) {
+  // Update active nav link
+  document.querySelectorAll('[data-route]').forEach(link => {
+    link.classList.remove('active');
+    if (link.getAttribute('href') === `#${route}`) {
+      link.classList.add('active');
+    }
+  });
+  
+  // Scroll to section
+  const section = document.getElementById(`${route}-section`);
+  if (section) {
+    section.scrollIntoView({ behavior: 'smooth' });
+  }
+}
+
+// Open product customizer
+function openCustomizer(productId) {
+  const product = state.products.find(p => p.id === productId);
+  if (!product) return;
+  
+  state.currentProduct = product;
+  
+  // Update customizer UI
+  document.getElementById('customizer-title').textContent = `Customize ${product.title}`;
+  document.getElementById('customizer-price').textContent = `₨ ${product.price}`;
+  
+  // Generate color palette
+  const colors = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#000000', '#ffffff'];
+  const colorPalette = document.getElementById('color-palette');
+  colorPalette.innerHTML = colors.map(color => `
+    <div class="color-swatch ${color === '#3b82f6' ? 'selected' : ''}" 
+         style="background-color:${color}" 
+         onclick="selectColor(this, '${color}')"></div>
+  `).join('');
+  
+  // Show modal
+  elements.customizerModal.classList.add('visible');
+}
+
+// Select color in customizer
+function selectColor(element, color) {
+  document.querySelectorAll('.color-swatch').forEach(swatch => {
+    swatch.classList.remove('selected');
+  });
+  element.classList.add('selected');
+  
+  // Update preview (simplified)
+  const preview = document.getElementById('customizer-preview');
+  preview.style.background = `linear-gradient(135deg, ${color}20, ${color}40)`;
+  preview.innerHTML = `
+    <div style="text-align:center;color:var(--muted)">
+      <i class="fas fa-cube" style="font-size:3rem;margin-bottom:16px;color:${color}"></i>
+      <div>${state.currentProduct.title}</div>
+      <div class="small" style="margin-top:8px">Color: ${color}</div>
+    </div>
+  `;
+}
+
+// Add or update product in admin
+function addOrUpdateProduct() {
+  const title = document.getElementById('product-title').value;
+  const price = parseInt(document.getElementById('product-price').value);
+  const image = document.getElementById('product-image').value;
+  const description = document.getElementById('product-description').value;
+  const category = document.getElementById('product-category').value;
+  const productState = document.getElementById('product-state').value;
+  
+  if (!title || !price || !category) {
+    showNotification('Please fill all required fields', 'error');
+    return;
+  }
+  
+  const newProduct = {
+    id: `p${Date.now()}`,
+    title,
+    price,
+    image,
+    description,
+    category,
+    state: productState
+  };
+  
+  state.products.push(newProduct);
+  saveProducts();
+  renderProducts();
+  renderAdminProducts();
+  updateStats();
+  
+  // Clear form
+  document.getElementById('product-title').value = '';
+  document.getElementById('product-price').value = '';
+  document.getElementById('product-image').value = '';
+  document.getElementById('product-description').value = '';
+  
+  showNotification('Product added successfully!', 'success');
+}
+
+// Render products in admin panel
+function renderAdminProducts() {
+  elements.adminProductsList.innerHTML = state.products.map(product => `
+    <div class="card" style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <div style="flex:1">
+          <h3 style="margin-bottom:8px">${product.title}</h3>
+          <div class="small" style="margin-bottom:8px">${product.description}</div>
+          <div style="display:flex;gap:16px;flex-wrap:wrap">
+            <span class="small" style="background:#f1f5f9;padding:4px 8px;border-radius:6px">
+              <i class="fas fa-tag"></i> ${product.category}
+            </span>
+            <span class="small" style="background:#f1f5f9;padding:4px 8px;border-radius:6px">
+              <i class="fas fa-money-bill"></i> ₨ ${product.price}
+            </span>
+            <span class="small" style="background:#f1f5f9;padding:4px 8px;border-radius:6px">
+              <i class="fas fa-circle" style="color:${
+                product.state === 'active' ? '#10b981' : 
+                product.state === 'draft' ? '#f59e0b' : '#6b7280'
+              }"></i> ${product.state}
+            </span>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="admin-btn" onclick="editProduct('${product.id}')">
+            <i class="fas fa-edit"></i>
+          </button>
+          <button class="admin-btn danger" onclick="deleteProduct('${product.id}')">
+            <i class="fas fa-trash"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+// Edit product
+function editProduct(productId) {
+  const product = state.products.find(p => p.id === productId);
+  if (!product) return;
+  
+  document.getElementById('product-title').value = product.title;
+  document.getElementById('product-price').value = product.price;
+  document.getElementById('product-image').value = product.image;
+  document.getElementById('product-description').value = product.description;
+  document.getElementById('product-category').value = product.category;
+  document.getElementById('product-state').value = product.state;
+  
+  // Scroll to form
+  document.getElementById('product-title').scrollIntoView({ behavior: 'smooth' });
+}
+
+// Delete product
+function deleteProduct(productId) {
+  if (confirm('Are you sure you want to delete this product?')) {
+    state.products = state.products.filter(p => p.id !== productId);
+    saveProducts();
+    renderProducts();
+    renderAdminProducts();
+    updateStats();
+    showNotification('Product deleted', 'success');
+  }
+}
+
+// Export products to CSV
+function exportProducts() {
+  const csvContent = "data:text/csv;charset=utf-8," 
+    + "id,title,price,description,category,image_url,state\n"
+    + state.products.map(p => 
+        `"${p.id}","${p.title}",${p.price},"${p.description}","${p.category}","${p.image}","${p.state}"`
+      ).join("\n");
+  
+  const encodedUri = encodeURI(csvContent);
+  const link = document.createElement("a");
+  link.setAttribute("href", encodedUri);
+  link.setAttribute("download", "xustom3d_products.csv");
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  
+  showNotification('Products exported successfully', 'success');
+}
+
+// Import products from CSV
+function importProducts() {
+  const csvData = document.getElementById('import-area').value;
+  if (!csvData) {
+    showNotification('Please paste CSV data', 'error');
+    return;
+  }
+  
+  try {
+    const lines = csvData.split('\n');
+    const headers = lines[0].split(',');
+    
+    // Skip header row and process data
+    for (let i = 1; i < lines.length; i++) {
+      const values = lines[i].split(',');
+      if (values.length === headers.length) {
+        const product = {
+          id: values[0].replace(/"/g, ''),
+          title: values[1].replace(/"/g, ''),
+          price: parseInt(values[2]),
+          description: values[3].replace(/"/g, ''),
+          category: values[4].replace(/"/g, ''),
+          image: values[5].replace(/"/g, ''),
+          state: values[6].replace(/"/g, '') || 'active'
+        };
+        
+        // Check if product already exists
+        const existingIndex = state.products.findIndex(p => p.id === product.id);
+        if (existingIndex >= 0) {
+          state.products[existingIndex] = product;
+        } else {
+          state.products.push(product);
+        }
+      }
+    }
+    
+    saveProducts();
+    renderProducts();
+    renderAdminProducts();
+    updateStats();
+    elements.importModal.classList.remove('visible');
+    document.getElementById('import-area').value = '';
+    
+    showNotification('Products imported successfully', 'success');
+  } catch (error) {
+    showNotification('Error importing CSV data', 'error');
+    console.error(error);
+  }
+}
+
+// Update admin statistics
+function updateStats() {
+  document.getElementById('stats-products').textContent = state.products.length;
+  document.getElementById('stats-orders').textContent = state.orders.length;
+  document.getElementById('admin-stats').textContent = `${state.products.length} products total`;
+}
+
+// Save products to localStorage
+function saveProducts() {
+  localStorage.setItem('xustom3d-products', JSON.stringify(state.products));
+}
+
+// Show notification
+function showNotification(message, type = 'info') {
+  const notification = elements.notification;
+  notification.textContent = message;
+  notification.className = `notification ${type} show`;
+  
+  setTimeout(() => {
+    notification.classList.remove('show');
+  }, 3000);
+}
+
+// Send contact message
+function sendContactMessage() {
+  const name = document.getElementById('contact-name').value;
+  const email = document.getElementById('contact-email').value;
+  const phone = document.getElementById('contact-phone').value;
+  const message = document.getElementById('contact-message').value;
+  
+  if (!name || !email || !message) {
+    showNotification('Please fill all required fields', 'error');
+    return;
+  }
+  
+  // Simulate sending message
+  showNotification('Message sent successfully! We will get back to you soon.', 'success');
+  
+  // Clear form
+  document.getElementById('contact-name').value = '';
+  document.getElementById('contact-email').value = '';
+  document.getElementById('contact-phone').value = '';
+  document.getElementById('contact-message').value = '';
+}
+
+// Initialize the application when DOM is loaded
+document.addEventListener('DOMContentLoaded', init);
